@@ -9,21 +9,41 @@ import praw
 import prawcore
 import yaml
 
-CONFIG_PATH = os.getenv("RPN_CONFIG", "config.yaml")
-LOGGING = os.getenv("RPN_LOGGING", "FALSE")
+import logging
+import argparse
+
+from collections import Counter
+
+CONFIG_PATH = os.getenv("RPN_CONFIG", "config.yml")
+LOG_LEVEL = os.getenv("LOGLEVEL", "INFO")
+logger = logging.getLogger(__name__)
+logger.setLevel(LOG_LEVEL)
+logger.addHandler(logging.StreamHandler(sys.stdout))
 
 YAML_KEY_APPRISE = "apprise"
 YAML_KEY_REDDIT = "reddit"
 YAML_KEY_SUBREDDITS = "subreddits"
+YAML_KEY_SUBREDDIT_CONTAINS = "contains"
+YAML_KEY_SUBREDDIT_FILTER = "filter"
 YAML_KEY_CLIENT = "client"
 YAML_KEY_SECRET = "secret"
 YAML_KEY_AGENT = "agent"
+YAML_KEY_REDIRECT = "redirect"
+YAML_KEY_LOGLEVEL = "loglevel"
+
+do_notify=True
+do_pass=False
 
 
 def main():
     """Run application."""
-    print("Starting Reddit Post Notifier")
+    logger.info("Starting Reddit Post Notifier")
+    args = parse_args()
     config = get_config()
+
+    logger.setLevel(config[YAML_KEY_LOGLEVEL])
+    logger.info(f"Logging at level {config[YAML_KEY_LOGLEVEL]}.")
+
     apprise_config = config[YAML_KEY_APPRISE]
     reddit_config = config[YAML_KEY_REDDIT]
 
@@ -32,12 +52,30 @@ def main():
     reddit_client = get_reddit_client(
         reddit_config[YAML_KEY_CLIENT],
         reddit_config[YAML_KEY_SECRET],
-        reddit_config[YAML_KEY_AGENT]
+        reddit_config[YAML_KEY_AGENT],
+        reddit_config[YAML_KEY_REDIRECT]
     )
 
-    validate_subreddits(reddit_client, subreddits)
-    stream_submissions(reddit_client, subreddits, apprise_client)
+    global do_notify
+    do_notify = not args.no_notify
 
+    global do_pass
+    do_pass = not args.pass_always
+
+    if not args.test_id:
+        validate_subreddits(reddit_client, subreddits)
+        stream_submissions(reddit_client, subreddits, apprise_client)
+    else:
+        process_submission(reddit_client.submission(id=args.test_id), subreddits, apprise_client)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--test-id', help='test reddit submission id')
+    parser.add_argument('--no-notify', default=False, action='store_true', help='dont notify.')
+    parser.add_argument('--pass-always', default=False, action='store_true', help='always pass testing post criteria.')
+
+    return parser.parse_args()
 
 def stream_submissions(reddit, subreddits, apprise_client):
     """Monitor and process new Reddit submissions in given subreddits."""
@@ -55,40 +93,122 @@ def stream_submissions(reddit, subreddits, apprise_client):
 
         except (praw.exceptions.PRAWException,
                 prawcore.exceptions.PrawcoreException) as exception:
-            print("Reddit API Error: ")
-            print(exception)
-            print("Pausing for 30 seconds...")
+            logger.error("Reddit API Error: ")
+            logger.error(exception)
+            logger.error("Pausing for 30 seconds...")
             time.sleep(30)
 
 
 def process_submission(submission, subreddits, apprise_client):
     """Notify if given submission matches search."""
-    title = submission.title
     sub = submission.subreddit.display_name
-    search_terms = subreddits[sub.lower()]
+    search_terms = subreddits[sub.lower()][YAML_KEY_SUBREDDIT_CONTAINS]
+    filter_terms = subreddits[sub.lower()][YAML_KEY_SUBREDDIT_FILTER]
 
-    if any(term in title.lower() for term in search_terms):
-        notify(apprise_client, title, submission.id)
-        if LOGGING != "FALSE":
-            print(datetime.datetime.fromtimestamp(submission.created_utc),
-                  " " + "r/" + sub + ": " + title)
+    tested_true, matched_keys = test_submission(submission, search_terms, filter_terms)
+
+    if tested_true:
+        if do_notify or do_pass:
+            notify(apprise_client, submission, matched_keys)
+            
+def test_submission(submission, search_terms, filter_terms):
+    match_candidates_dict = {}
+    for attribute_key in 'link_flair_text', 'selftext', 'title':
+        try:
+            match_candidates_dict[attribute_key] = getattr(submission, attribute_key).lower()
+        except AttributeError:
+            pass
+        else:
+            break
+    logger.debug(match_candidates_dict)
+
+    submission_matched_keys = []
+    submission_filtered_keys = []
+    for candidate_key in match_candidates_dict.keys():
+        if any(search_term in match_candidates_dict[candidate_key] for search_term in search_terms):
+            submission_matched_keys.append(candidate_key)
+        if filter_terms and any(filter_term in match_candidates_dict[candidate_key] for filter_term in filter_terms):
+            submission_matched_keys.append(submission_filtered_keys)
+    if len(submission_matched_keys) > 0:
+        if len(submission_filtered_keys) > 0:
+            for filter in submission_filtered_keys:
+                logger.debug(f"Filtered submission[{submission}]: {filter}")
+            return False
+        for match in submission_matched_keys:
+            logger.debug(f"Matched submission[{submission}]: {match}")
+        return True, submission_matched_keys
+    logger.debug(f"No Matches for {submission} {match_candidates_dict}")
+    return False
 
 
-def notify(apprise_client, title, submission_id):
+    # match_candidates=[]
+    # if submission.link_flair_text and not submission.link_flair_text == '':
+    #     match_candidates.append(submission.link_flair_text.lower())
+    # if submission.selftext and not submission.selftext == '':
+    #     match_candidates.append(submission.selftext.lower())
+    # if submission.title and not submission.title == '':
+    #     match_candidates.append(submission.title.lower())
+    # logger.debug(match_candidates)
+    # submission_matched = False
+    # submission_filtered = False
+    # for candidate in match_candidates:
+    #     if any(search_term in candidate for search_term in search_terms):
+    #         submission_matched = True
+    #     if filter_terms and any(filter_term in candidate for filter_term in filter_terms):
+    #         submission_filtered = True
+    # if submission_matched:
+    #     if submission_filtered:
+    #         logger.debug(f"Filtered submission[{submission}]: {candidate}")
+    #         return False
+    #     logger.debug(f"Matched submission[{submission}]: {candidate}")
+    #     return True
+    # logger.debug(f"No Matches for {submission} {match_candidates}")
+    # return False
+
+
+def notify(apprise_client, submission, matched_keys):
     """Send apprise notification."""
+    title = submission.title
+    author = submission.author
+    pic='no pic' if submission.is_self else 'pic'
+    
+    body= f"{author.name} ({author.link_karma}/{author.comment_karma})[{pic}]\n"
+    body+=f"Matched on: {matched_keys}\n"
+    body+=f"https://www.reddit.com{submission.permalink}\n"
+    body+= "---\n"
+    body+=f"https://www.reddit.com/u/{submission.author.name}\n"
+    body+= "---\n"
+    body+=f"{summarize_posts(author)}"
+    
     apprise_client.notify(
         title=title,
-        body="https://www.reddit.com/" + submission_id,
+        body=body,
     )
 
+    logger.info(f"{datetime.datetime.fromtimestamp(submission.created_utc)} r/{submission.subreddit.display_name}: {submission.title}")
 
-def get_reddit_client(cid, secret, agent):
+
+def summarize_posts(author):
+    posted_reddits = []
+    for post in author.submissions.hot():
+        posted_reddits.append(post.subreddit.display_name)
+    sub_counts = Counter(posted_reddits)
+    sub_summary = ''
+    for posted_reddit in sub_counts.keys():
+        sub_summary += f"{posted_reddit}: {sub_counts[posted_reddit]}\n"
+    return sub_summary
+
+
+def get_reddit_client(cid, secret, agent, redirect):
     """Return PRAW Reddit instance."""
-    return praw.Reddit(
+    reddit = praw.Reddit(
         client_id=cid,
         client_secret=secret,
-        user_agent=agent
+        user_agent=agent,
+        redirect_uri=redirect
     )
+    logger.info(reddit.auth.url(scopes=["identity"], state="...", duration="permanent"))
+    return reddit
 
 
 def get_apprise_client(config):
@@ -113,7 +233,7 @@ def check_config_file():
     if not os.path.exists(CONFIG_PATH):
         sys.exit("Missing config file: " + CONFIG_PATH)
 
-    print("Using config file: " + CONFIG_PATH)
+    logger.info("Using config file: " + CONFIG_PATH)
 
 
 def load_config():
@@ -127,7 +247,7 @@ def load_config():
         except yaml.YAMLError as exception:
             if hasattr(exception, "problem_mark"):
                 mark = exception.problem_mark # pylint: disable=no-member
-                print("Invalid yaml, line %s column %s" % (mark.line + 1, mark.column + 1))
+                logger.error("Invalid yaml, line %s column %s" % (mark.line + 1, mark.column + 1))
 
             sys.exit("Invalid config: failed to parse yaml")
 
@@ -159,20 +279,29 @@ def validate_config(config):
     if YAML_KEY_APPRISE not in config or not isinstance(config[YAML_KEY_APPRISE], list):
         sys.exit("Invalid config: missing apprise config")
 
-    print("Monitoring Reddit for:")
+    logger.info("Monitoring Reddit for:")
 
     subs = reddit[YAML_KEY_SUBREDDITS]
-    for conf in subs:
-        current = subs[conf]
+    for subreddit_search_config_key in subs:
+        logger.info(f"\tr/{subreddit_search_config_key}:")
+        subreddit_search_config = subs[subreddit_search_config_key]
 
-        if not isinstance(current, list) or not current:
-            sys.exit("Invalid config: \'" + conf + "\' needs a list of search strings")
+        if not subreddit_search_config[YAML_KEY_SUBREDDIT_CONTAINS] or not isinstance(subreddit_search_config[YAML_KEY_SUBREDDIT_CONTAINS], list):
+            sys.exit(f"Invalid config: '{subreddit_search_config}' needs a list of search strings in 'contains'.")
+        elif not all(isinstance(item, str) for item in subreddit_search_config[YAML_KEY_SUBREDDIT_CONTAINS]):
+            sys.exit(f"Invalid config: '{subreddit_search_config}' needs a list of search strings in 'contains'.")
+        else:
+            subreddit_search_config[YAML_KEY_SUBREDDIT_CONTAINS] = [x.lower() for x in subreddit_search_config[YAML_KEY_SUBREDDIT_CONTAINS]]
 
-        if not all(isinstance(item, str) for item in current):
-            sys.exit("Invalid config: \'" + conf + "\' needs a list of search strings")
+        if subreddit_search_config[YAML_KEY_SUBREDDIT_FILTER] and not isinstance(subreddit_search_config[YAML_KEY_SUBREDDIT_FILTER], list):
+            sys.exit(f"Invalid config: '{subreddit_search_config}' needs a list of search strings in 'filter' if used.")
+        elif subreddit_search_config[YAML_KEY_SUBREDDIT_FILTER] and not all(isinstance(item, str) for item in subreddit_search_config[YAML_KEY_SUBREDDIT_FILTER]):
+            sys.exit(f"Invalid config: '{subreddit_search_config}' needs a list of search strings in 'filter' if used.")
+        else:
+            subreddit_search_config[YAML_KEY_SUBREDDIT_FILTER] = [x.lower() for x in subreddit_search_config[YAML_KEY_SUBREDDIT_FILTER]]
 
-        subs[conf] = [x.lower() for x in current]
-        print("\tr/" + conf + ": ", current)
+        logger.info(f"\t\t Match:  {subreddit_search_config[YAML_KEY_SUBREDDIT_CONTAINS]}")
+        logger.info(f"\t\t Filter: {subreddit_search_config[YAML_KEY_SUBREDDIT_FILTER]}")
 
     print("")
     reddit[YAML_KEY_SUBREDDITS] = {k.lower(): v for k, v in subs.items()}
@@ -190,8 +319,8 @@ def validate_subreddits(reddit, subreddits):
 
         except (praw.exceptions.PRAWException,
                 prawcore.exceptions.PrawcoreException) as exception:
-            print("Reddit API Error: ")
-            print(exception)
+            logger.error(f"[ {sub} ] Reddit API Error: ")
+            logger.info(exception)
 
 
 if __name__ == "__main__":
